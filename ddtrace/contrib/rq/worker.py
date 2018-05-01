@@ -1,6 +1,3 @@
-# stdlib
-import os
-
 # Third party
 import wrapt
 
@@ -8,11 +5,16 @@ import wrapt
 from ddtrace import Pin
 from ddtrace.ext import AppTypes
 from ddtrace.util import unwrap
+from .util import (
+    require_pin,
+    APP,
+    SERVICE,
+)
 
-APP = 'rq'
-SERVICE = os.environ.get('DATADOG_SERVICE_NAME') or 'rq'
+# Note: this is essentially a direct port of the Celery contrib module
 
-def patch_worker(worker):
+
+def patch_worker(worker, pin=None):
     """ patch_worker will add tracing to a rq worker"""
     patch_methods = [
         ('__init__', _worker_init),
@@ -21,10 +23,22 @@ def patch_worker(worker):
 
     _w = wrapt.wrap_function_wrapper
     for method_name, wrapper in patch_methods:
-        _w('rq.worker', 'Worker.{}'.format(method_name), wrapper)
+        method = getattr(worker, method_name, None)
+        if method is None:
+            continue
+
+        # Do not patch if method is already patched
+        if isinstance(method, wrapt.ObjectProxy):
+            continue
+
+        # Patch the method
+        setattr(worker, method_name, wrapt.BoundFunctionWrapper(method, worker, wrapper))
+
+    pin = pin or Pin(service=SERVICE, app=APP, app_type=AppTypes.worker)
+    pin.onto(worker)
+    return worker
 
 
-# TODO: fixme, need to unpatch correctly
 def unpatch_worker(worker):
     """ unpatch_worker will remove tracing from a rq worker"""
     patch_methods = [
@@ -42,21 +56,22 @@ def unpatch_worker(worker):
             continue
 
         # Restore original method
-        unwrap(getattr(worker, method_name))
+        setattr(worker, method_name, wrapper.__wrapped__)
 
 
-# TODO: determine how pin worker instances
 def _worker_init(func, instance, args, kwargs):
-    pin = Pin(service=SERVICE, app=APP, app_type=AppTypes.worker)
+    func(*args, **kwargs)
 
-
-# TODO: determine metadata, how to extract pin
-def _worker_execute_job(func, instance, args, kwargs):
+    # Patch only if pin is enabled
     pin = Pin.get_from(instance)
-    if not pin or not pin.enabled():
-        return func(*args, **kwargs)
+    if pin and pin.enabled():
+        patch_worker(instance, pin=pin)
 
+
+@require_pin
+def _worker_execute_job(pin, func, _instance, args, kwargs):
+    job, queue = args
     with pin.tracer.trace('rq.worker', service=pin.service, span_type='rq') as span:
-        span.set_meta('job_id', res.id)
-        span.set_meta('state', res.state)
+        span.set_meta('job_id', job.id)
+        span.set_meta('queue_name', queue.name)
         return func(*args, **kwargs)
